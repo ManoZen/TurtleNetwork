@@ -10,22 +10,13 @@ import com.wavesplatform.state2._
 import com.wavesplatform.state2.patch.{CancelAllLeases, CancelLeaseOverflow}
 import com.wavesplatform.state2.reader.CompositeStateReader.composite
 import com.wavesplatform.state2.reader.SnapshotStateReader
-import monix.eval.Task
-import monix.execution.Scheduler
-import monix.execution.schedulers.SchedulerService
 import scorex.account.Address
 import scorex.block.{Block, MicroBlock}
 import scorex.transaction.ValidationError.ActivationError
-import scorex.transaction.{History, Transaction, ValidationError}
+import scorex.transaction.{Transaction, ValidationError}
 import scorex.utils.ScorexLogging
 
-import scala.collection.SortedMap
-import scala.concurrent.Await
-import scala.concurrent.duration.Duration
-
 object BlockDiffer extends ScorexLogging with Instrumented {
-
-  private implicit val scheduler: SchedulerService = Scheduler.computation(name = "block-deser")
 
   def right(diff: Diff): Either[ValidationError, Diff] = Right(diff)
 
@@ -72,16 +63,6 @@ object BlockDiffer extends ScorexLogging with Instrumented {
       (prependCompactBlockDiff(blockDiff, diffs, maxTxsInChunk), Some(block))
     }._1
 
-  def unsafeDiffByRange(fs: FunctionalitySettings, fp: FeatureProvider, h: History, maxTransactionsPerChunk: Int)(state: SnapshotStateReader, upto: Int): NEL[BlockDiff] = {
-    val from = state.height + 1
-    val blocks = measureLog(s"Reading blocks from $from up upto $upto") {
-      Await.result(Task.wander(Range(from, upto).map(h.blockBytes))(b => Task(Block.parseBytes(b.get).get)).runAsyncLogErr, Duration.Inf)
-    }
-    measureLog(s"Building diff from $from up to $upto") {
-      BlockDiffer.unsafeDiffMany(fs, fp, state, h.blockAt(from - 1), maxTransactionsPerChunk)(blocks)
-    }
-  }
-
   private def apply(settings: FunctionalitySettings, s: SnapshotStateReader, pervBlockTimestamp: Option[Long])
                    (blockGenerator: Address, prevBlockFeeDistr: Option[Diff], currentBlockFeeDistr: Option[Diff],
                     timestamp: Long, txs: Seq[Transaction], heightDiff: Int): Either[ValidationError, BlockDiff] = {
@@ -111,16 +92,22 @@ object BlockDiffer extends ScorexLogging with Instrumented {
       else diffWithCancelledLeases
 
       val newSnapshots = diffWithLeasePatches.portfolios
-        .collect { case (acc, portfolioDiff) if portfolioDiff.balance != 0 || portfolioDiff.effectiveBalance != 0 =>
-          val oldPortfolio = s.partialPortfolio(acc, Set.empty[ByteStr])
-          if (s.lastUpdateHeight(acc).contains(currentBlockHeight)) {
-            throw new Exception(s"CRITICAL: attempting to build a circular reference in snapshot list. " +
-              s"acc=$acc, currentBlockHeight=$currentBlockHeight")
+        .map { case (acc, portfolioDiff) =>
+          val oldPortfolio = s.wavesBalance(acc)
+          val newWavesBalance = if (portfolioDiff.balance != 0 || portfolioDiff.effectiveBalance != 0)
+            Some(WavesBalance(safeSum(oldPortfolio.regularBalance, portfolioDiff.balance),
+              math.max(safeSum(oldPortfolio.effectiveBalance, portfolioDiff.effectiveBalance), 0L)))
+            else None
+          val stateAssetBalances = s.assetBalance(acc)
+          val assetBalances: Map[ByteStr, Long] = if (portfolioDiff.assets.isEmpty) Map.empty else {
+            portfolioDiff.assets.map {
+              case (assetId, diff) =>
+                val newValue = safeSum(stateAssetBalances.getOrElse(assetId, 0L), diff)
+                require(newValue >= 0, s"Negative balance $newValue for asset $assetId on $acc")
+                assetId -> newValue
+            }
           }
-          acc -> SortedMap(currentBlockHeight -> Snapshot(
-            prevHeight = s.lastUpdateHeight(acc).getOrElse(0),
-            balance = oldPortfolio.balance + portfolioDiff.balance,
-            effectiveBalance = oldPortfolio.effectiveBalance + portfolioDiff.effectiveBalance))
+          acc -> Snapshot(newWavesBalance, assetBalances = assetBalances)
         }
       BlockDiff(diffWithLeasePatches, heightDiff, newSnapshots)
     }
